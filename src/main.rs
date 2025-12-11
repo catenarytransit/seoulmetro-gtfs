@@ -244,12 +244,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let total = stations.len();
     for (i, station) in stations.iter().enumerate() {
-        if i % 10 == 0 {
-            println!("Scraping {}/{} - {} (UID: {})", i + 1, total, station.name, station.uid);
-        }
+        
+        println!("Scraping {}/{} - {} (UID: {})", i + 1, total, station.name, station.uid);
         
         // Add delay to be more patient and prevent timeouts
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(100));
         
         // Fetch
         let url = format!("http://www.seoulmetro.co.kr/kr/getStationInfo.do?action=info&stationId={}", station.uid);
