@@ -1,15 +1,19 @@
 use regex::Regex;
 use scraper::{Html, Selector};
-use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs;
-use std::thread;
 use std::time::Duration;
 use std::io::Write; 
+use std::sync::OnceLock;
 use osmpbfreader::{OsmPbfReader, OsmObj};
 use tokio::task;
+use futures::stream::{self, StreamExt};
+
+static TRAILING_COMMA_REGEX: OnceLock<Regex> = OnceLock::new();
+static TIME_REGEX: OnceLock<Regex> = OnceLock::new();
+static ROUTE_REGEX: OnceLock<Regex> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct Station {
@@ -117,6 +121,98 @@ fn load_osm_stations(path: &str) -> Result<HashMap<String, (f64, f64)>, Box<dyn 
     Ok(station_map)
 }
 
+async fn scrape_station(client: &reqwest::Client, station: Station, index: usize) -> Vec<TrainSchedule> {
+    // println!("Scraping #{} - {} (UID: {})", index, station.name, station.uid); // Optional logging, might require sync printing or too verbose
+    // Add delay to be more patient and prevent timeouts (per-task delay)
+    // Note: If using async context, use tokio::time::sleep instead of std::thread::sleep to avoid blocking the runtime thread
+    //tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let time_regex = TIME_REGEX.get_or_init(|| Regex::new(r"(\d+)분").unwrap());
+    let route_regex = ROUTE_REGEX.get_or_init(|| Regex::new(r"\((.+)\s*>\s*(.+)\)").unwrap());
+
+    // Fetch
+    let url = format!("http://www.seoulmetro.co.kr/kr/getStationInfo.do?action=info&stationId={}", station.uid);
+    let mut resp = None;
+    for attempt in 0..16 {
+        match client.get(&url)
+            .header("Referer", "http://www.seoulmetro.co.kr/kr/cyberStation.do")
+            .send()
+            .await {
+            Ok(r) => {
+                resp = Some(r);
+                break;
+            },
+            Err(e) => {
+                if attempt < 8 {
+                    // Backoff
+                    tokio::time::sleep(Duration::from_millis(100 * (attempt + 1) as u64)).await;
+                } else {
+                    eprintln!("Failed to fetch {} after returns: {}", station.name, e);
+                    return Vec::new();
+                }
+            }
+        }
+    }
+    let resp = resp.unwrap();
+    
+    let html_text = match resp.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Failed to read body {}: {}", station.name, e);
+            return Vec::new();
+        }
+    };
+
+    // Parse
+    let fragment = Html::parse_document(&html_text);
+    let table_selector = Selector::parse("#page2 table.stationInfoAllTimeTable").unwrap();
+    let a_selector = Selector::parse("tbody ul li a").unwrap();
+
+    let mut station_schedules = Vec::new();
+    
+    for table in fragment.select(&table_selector) {
+        let hour_str = table.value().attr("time").unwrap_or("00");
+        
+        for element in table.select(&a_selector) {
+            let week_tag = element.value().attr("week").unwrap_or("1"); 
+            let train_no = element.value().attr("train-no").unwrap_or("");
+            let line_name = element.value().attr("line").unwrap_or("");
+            let in_out = element.value().attr("inouttag").unwrap_or("1");
+            let text = element.text().collect::<Vec<_>>().join("");
+            
+            if let Some(caps) = time_regex.captures(&text) {
+                let min_str = &caps[1];
+                let formatted_time = format!("{}:{}:00", hour_str, min_str);
+                
+                let dest = if let Some(route_caps) = route_regex.captures(&text) {
+                    route_caps[2].trim().to_string()
+                } else {
+                    "Unknown".to_string()
+                };
+
+                station_schedules.push(TrainSchedule {
+                    station_uid: station.uid.clone(),
+                    week_tag: week_tag.to_string(),
+                    train_no: train_no.to_string(),
+                    line_name: line_name.to_string(),
+                    in_out_tag: in_out.to_string(),
+                    arrival_time: formatted_time.clone(),
+                    departure_time: formatted_time,
+                    dest_station: dest,
+                });
+            }
+        }
+    }
+    
+    if station_schedules.is_empty() {
+        // println!("  Warning: Found 0 schedules for {}. HTML length: {}", station.name, html_text.len());
+    } else {
+        println!("Fetched {} - {} schedules.", station.name, station_schedules.len());
+    }
+
+    station_schedules
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // 1. Prepare Data Sources
@@ -131,7 +227,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("Fetching station_data.js from server...");
     let station_data_url = "http://www.seoulmetro.co.kr/kr/getLineData.do";
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
+        .timeout(Duration::from_secs(600))
         .user_agent("Mozilla/5.0")
         .build()?;
     let resp = client.get(station_data_url)
@@ -146,7 +242,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let json_str = json_str.trim_end_matches(';');
     
     // Remove trailing commas to make it valid JSON
-    let re_trailing = Regex::new(r",(\s*[}\]])").unwrap();
+    let re_trailing = TRAILING_COMMA_REGEX.get_or_init(|| Regex::new(r",(\s*[}\]])").unwrap());
     let json_str_clean = re_trailing.replace_all(json_str, "$1");
     
     let lines_data: HashMap<String, Value> = serde_json::from_str(&json_str_clean)?;
@@ -237,87 +333,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("Found {} unique stations to scrape.", stations.len());
 
     // 3. Scrape Timetables
-    let mut all_schedules = Vec::new();
+    println!("Starting concurrent scraping for {} stations...", stations.len());
     
-    let time_regex = Regex::new(r"(\d+)분").unwrap();
-    let route_regex = Regex::new(r"\((.+)\s*>\s*(.+)\)").unwrap();
-
-    let total = stations.len();
-    for (i, station) in stations.iter().enumerate() {
-        
-        println!("Scraping {}/{} - {} (UID: {})", i + 1, total, station.name, station.uid);
-        
-        // Add delay to be more patient and prevent timeouts
-        thread::sleep(Duration::from_millis(100));
-        
-        // Fetch
-        let url = format!("http://www.seoulmetro.co.kr/kr/getStationInfo.do?action=info&stationId={}", station.uid);
-        let resp = match client.get(&url)
-            .header("Referer", "http://www.seoulmetro.co.kr/kr/cyberStation.do")
-            .header("Connection", "close")
-            .send()
-            .await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Failed to fetch {}: {}", station.name, e);
-                continue;
+    // We clone the client for each task (it's cheap, Arc internally)
+    // We move the station into the async block
+    let fetches = stream::iter(stations.iter().cloned().enumerate())
+        .map(|(i, station)| {
+            let client = client.clone();
+            async move {
+                scrape_station(&client, station, i).await
             }
-        };
-        
-        let html_text = match resp.text().await {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("Failed to read body {}: {}", station.name, e);
-                continue;
-            }
-        };
+        })
+        .buffer_unordered(4); // Concurrency limit
 
-        // Parse
-        let fragment = Html::parse_document(&html_text);
-        let table_selector = Selector::parse("#page2 table.stationInfoAllTimeTable").unwrap();
-        let a_selector = Selector::parse("tbody ul li a").unwrap();
+    let all_schedules_nested: Vec<Vec<TrainSchedule>> = fetches.collect().await;
+    let all_schedules: Vec<TrainSchedule> = all_schedules_nested.into_iter().flatten().collect();
 
-        let mut station_schedule_count = 0;
-        
-        for table in fragment.select(&table_selector) {
-            let hour_str = table.value().attr("time").unwrap_or("00");
-            
-            for element in table.select(&a_selector) {
-                let week_tag = element.value().attr("week").unwrap_or("1"); 
-                let train_no = element.value().attr("train-no").unwrap_or("");
-                let line_name = element.value().attr("line").unwrap_or("");
-                let in_out = element.value().attr("inouttag").unwrap_or("1");
-                let text = element.text().collect::<Vec<_>>().join("");
-                
-                if let Some(caps) = time_regex.captures(&text) {
-                    let min_str = &caps[1];
-                    let formatted_time = format!("{}:{}:00", hour_str, min_str);
-                    
-                    let dest = if let Some(route_caps) = route_regex.captures(&text) {
-                        route_caps[2].trim().to_string()
-                    } else {
-                        "Unknown".to_string()
-                    };
-
-                    all_schedules.push(TrainSchedule {
-                        station_uid: station.uid.clone(),
-                        week_tag: week_tag.to_string(),
-                        train_no: train_no.to_string(),
-                        line_name: line_name.to_string(),
-                        in_out_tag: in_out.to_string(),
-                        arrival_time: formatted_time.clone(),
-                        departure_time: formatted_time,
-                        dest_station: dest,
-                    });
-                    station_schedule_count += 1;
-                }
-            }
-        }
-        
-        if station_schedule_count == 0 {
-            // println!("  Warning: Found 0 schedules for {}. HTML length: {}", station.name, html_text.len());
-        }
-    }
+    println!("Scraping completed. Found total {} schedules.", all_schedules.len());
     
     // 4. GTFS Generation (Basic)
     println!("Generating GTFS files...");
@@ -365,7 +397,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     
     let mut wtr_trips = csv::Writer::from_path("gtfs_output/trips.txt")?;
-    wtr_trips.write_record(&["route_id", "service_id", "trip_id", "direction_id"])?;
+    wtr_trips.write_record(&["route_id", "service_id", "trip_id", "trip_short_name", "direction_id"])?;
     
     let mut wtr_st = csv::Writer::from_path("gtfs_output/stop_times.txt")?;
     wtr_st.write_record(&["trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence"])?;
@@ -403,7 +435,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let trip_id = format!("T_{}_{}", service_id, train_no);
         let direction_id = if events[0].in_out_tag == "1" { "0" } else { "1" };
         
-        wtr_trips.write_record(&[route_id.as_str(), service_id.as_str(), trip_id.as_str(), direction_id])?;
+        wtr_trips.write_record(&[route_id.as_str(), service_id.as_str(), trip_id.as_str(), train_no.as_str(), direction_id])?;
         
         for (i, bev) in events.iter().enumerate() {
             wtr_st.write_record(&[
