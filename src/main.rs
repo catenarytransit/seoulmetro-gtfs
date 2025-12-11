@@ -227,7 +227,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("Fetching station_data.js from server...");
     let station_data_url = "http://www.seoulmetro.co.kr/kr/getLineData.do";
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(600))
+        .timeout(Duration::from_secs(10))
         .user_agent("Mozilla/5.0")
         .build()?;
     let resp = client.get(station_data_url)
@@ -270,32 +270,78 @@ async fn main() -> Result<(), Box<dyn Error>> {
         route_name_map.insert(label.clone(), line_key.clone());
 
         if let Some(stations_array) = line_val.get("stations").and_then(|s| s.as_array()) {
-            for s in stations_array {
-                 if s.get("station-nm").is_none() || s.get("data-uid").is_none() {
+                let mut valid_stations = Vec::new();
+
+                for s in stations_array {
+                    if s.get("station-nm").is_none() || s.get("data-uid").is_none() {
+                        continue;
+                    }
+                    valid_stations.push(s);
+                }
+
+                if valid_stations.is_empty() {
+                    continue;
+                }
+
+                // Only take the first and last station
+                let stations_to_scrape = if valid_stations.len() > 1 {
+                    vec![valid_stations[0], valid_stations[valid_stations.len() - 1]]
+                } else {
+                    vec![valid_stations[0]]
+                };
+
+                for s in stations_to_scrape {
+                     let uid = s["data-uid"].as_str().unwrap().to_string();
+                     let raw_name = s["station-nm"].as_str().unwrap().to_string().replace("\r", "").replace("\n", " ");
+                     
+                     if station_uids.contains(&uid) {
+                         continue;
+                     }
+                     station_uids.insert(uid.clone());
+
+                    let name_stripped = raw_name.split('(').next().unwrap().trim().to_string();
+
+                 // Filter for termini based on line label
+                 let is_terminus = match label.as_str() {
+                     "1호선" => ["회기", "연천", "서울", "두정", "구로", "인천", "금천구청", "광명", "병점", "서동탄", "천안", "신창", "청량리"].contains(&name_stripped.as_str()),
+                     "2호선" => ["시청", "성수", "신설동", "신도림", "까치산"].contains(&name_stripped.as_str()),
+                     "3호선" => ["지축", "오금", "대화"].contains(&name_stripped.as_str()),
+                     "4호선" => ["남태령", "금정", "오이도", "불암산", "진접"].contains(&name_stripped.as_str()),
+                     "5호선" => ["방화", "상일동", "강동", "마천", "하남검단산"].contains(&name_stripped.as_str()),
+                     "6호선" => ["응암", "신내"].contains(&name_stripped.as_str()),
+                     "7호선" => ["장암", "석남"].contains(&name_stripped.as_str()),
+                     "8호선" => ["암사", "모란", "별내", "암사역사공원", "장자호수공원", "동구릉", "다산"].contains(&name_stripped.as_str()),
+                     "9호선" => ["개화", "중앙보훈병원"].contains(&name_stripped.as_str()),
+                     "우이신설경전철" => ["북한산우이", "신설동"].contains(&name_stripped.as_str()),
+                     "신림선" => ["샛강", "관악산"].contains(&name_stripped.as_str()),
+                     "공항철도" => ["서울", "인천공항2터미널"].contains(&name_stripped.as_str()),
+                     "경의중앙선" => ["서울", "문산", "임진강", "용산", "가좌", "회기", "청량리", "용문", "지평"].contains(&name_stripped.as_str()),
+                     "경춘선" => ["청량리", "상봉", "망우", "광운대", "춘천"].contains(&name_stripped.as_str()),
+                     "경강선" => ["판교", "여주"].contains(&name_stripped.as_str()),
+                     "수인분당선" => ["청량리", "왕십리", "수원", "인천"].contains(&name_stripped.as_str()),
+                     "신분당선" => ["신사", "광교"].contains(&name_stripped.as_str()),
+                     "서해선" => ["일산", "원시"].contains(&name_stripped.as_str()),
+                     "인천1호선" => ["검단호수공원", "송도달빛축제공원"].contains(&name_stripped.as_str()),
+                     "인천2호선" => ["검단오류", "운연"].contains(&name_stripped.as_str()),
+                     "자기부상철도" => ["인천공항1터미널", "용유"].contains(&name_stripped.as_str()), 
+                     "의정부경전철" => ["발곡", "차량기지 임시승강장", "탑석"].contains(&name_stripped.as_str()),
+                     "용인에버라인" => ["기흥", "전대·에버랜드"].contains(&name_stripped.as_str()),
+                     "김포골드라인" => ["양촌", "김포공항"].contains(&name_stripped.as_str()),
+                     "GTX-A" => ["수서", "동탄", "운정중앙", "서울"].contains(&name_stripped.as_str()),
+                     _ => false,
+                 };
+
+                 if !is_terminus {
                      continue;
                  }
                  
-                 let uid = s["data-uid"].as_str().unwrap().to_string();
-                 let raw_name = s["station-nm"].as_str().unwrap().to_string().replace("\r", "").replace("\n", " ");
-                 
-                 if station_uids.contains(&uid) {
-                     continue;
-                 }
                  station_uids.insert(uid.clone());
 
-                 // Normalize name for lookup
-                 // 1. Strip parentheses: "아라 (북부법원 검찰청)" -> "아라"
-                 let name_stripped = raw_name.split('(').next().unwrap().trim().to_string();
                  let name_with_suffix = format!("{}역", name_stripped);
                  let name_no_space = name_stripped.replace(" ", "");
                  let name_no_space_suffix = format!("{}역", name_no_space);
                  
                  // Lookup priority: 
-                 // 1. Exact Name (as given in JS)
-                 // 2. Stripped Name
-                 // 3. Stripped Name + "역"
-                 // 4. No Space Name
-                 // 5. No Space Name + "역"
                  let (lat, lon) = if let Some(&coords) = osm_stations.get(&raw_name) {
                      coords
                  } else if let Some(&coords) = osm_stations.get(&name_stripped) {
@@ -314,7 +360,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                          range_cache.insert(raw_name.clone(), coords);
                          coords
                      } else {
-                         println!("  Failed to find coordinates for '{}' (Tried: {}, {}, {}, {})", raw_name, name_stripped, name_with_suffix, name_no_space, name_no_space_suffix);
+                         // println!("  Failed to find coordinates for '{}' (Tried: {}, {}, {}, {})", raw_name, name_stripped, name_with_suffix, name_no_space, name_no_space_suffix);
                          (0.0, 0.0)
                      }
                  };
