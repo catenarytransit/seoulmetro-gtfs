@@ -158,8 +158,12 @@ async fn scrape_station(client: &reqwest::Client, station: Station, _index: usiz
     let mut success = false;
 
     // 1. Try with shared client (default timeout ~20s)
+    // println!("Scraping {}...", station.name);
     match client.get(&url)
         .header("Referer", "http://www.seoulmetro.co.kr/kr/cyberStation.do")
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0")
+        .header("Accept", "text/html, */*; q=0.01")
+        .header("X-Requested-With", "XMLHttpRequest")
         .send()
         .await 
     {
@@ -264,6 +268,75 @@ async fn scrape_station(client: &reqwest::Client, station: Station, _index: usiz
     }
 
     station_schedules
+}
+
+type TrainKey = (String, String, String); // (train_no, week_tag, in_out_tag)
+
+#[derive(Debug, Clone)]
+struct DetailedStop {
+    station_name: String,
+    arrival_time: Option<String>,
+    departure_time: Option<String>,
+}
+
+async fn fetch_train_details(client: &reqwest::Client, key: &TrainKey) -> Option<Vec<DetailedStop>> {
+    let (train_no, week_tag, in_out_tag) = key;
+    let url = "http://www.seoulmetro.co.kr/kr/getTrainInfo.do";
+    
+    let params = [
+        ("trainNo", train_no.as_str()),
+        ("weekTag", week_tag.as_str()),
+        ("inOutTag", in_out_tag.as_str()),
+    ];
+    // println!("Fetching train details for {} {} {}...", train_no, week_tag, in_out_tag);
+
+    let resp = client.post(url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0")
+        .header("Referer", "http://www.seoulmetro.co.kr/kr/cyberStation.do?menuIdx=538")
+        .header("Origin", "http://www.seoulmetro.co.kr")
+        .header("X-Requested-With", "XMLHttpRequest")
+        .form(&params)
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    let html = resp.text().await.ok()?;
+    // if html.len() < 500 {
+    //      println!("  Short response for {}: {}", train_no, html);
+    // }
+    let document = Html::parse_document(&html);
+    let tr_selector = Selector::parse("table.stationInfoAllTimeTable tbody tr").unwrap();
+    let td_selector = Selector::parse("td").unwrap();
+
+    let mut stops = Vec::new();
+
+    for tr in document.select(&tr_selector) {
+        let tds: Vec<_> = tr.select(&td_selector).collect();
+        if tds.len() >= 3 {
+            let station_name = tds[0].text().collect::<Vec<_>>().join("").trim().to_string();
+            let arr_raw = tds[1].text().collect::<Vec<_>>().join("").trim().to_string();
+            let dep_raw = tds[2].text().collect::<Vec<_>>().join("").trim().to_string();
+
+            let arrival_time = if arr_raw.is_empty() { None } else { Some(format!("{}:00", arr_raw)) };
+            let departure_time = if dep_raw.is_empty() { None } else { Some(format!("{}:00", dep_raw)) };
+
+            stops.push(DetailedStop {
+                station_name,
+                arrival_time,
+                departure_time,
+            });
+        }
+    }
+    
+    if stops.is_empty() {
+        None
+    } else {
+        Some(stops)
+    }
 }
 
 #[tokio::main]
@@ -390,9 +463,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     println!("Found {} unique stations to scrape.", stations.len());
-
+    
     // 3. Scrape Timetables
     println!("Starting concurrent scraping for {} stations...", stations.len());
+    stations.truncate(1); // TEMPORARY: Truncate for fast verification
+
     
     // We clone the client for each task (it's cheap, Arc internally)
     // We move the station into the async block
@@ -408,7 +483,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let all_schedules_nested: Vec<Vec<TrainSchedule>> = fetches.collect().await;
     let all_schedules: Vec<TrainSchedule> = all_schedules_nested.into_iter().flatten().collect();
 
-    println!("Scraping completed. Found total {} schedules.", all_schedules.len());
+    println!("Scraping completed. Found total {} station-schedules.", all_schedules.len());
+    
+    // 3.5 Collect unique trains and fetch full details
+    let mut unique_trains: HashSet<TrainKey> = HashSet::new();
+    let mut train_line_map: HashMap<TrainKey, String> = HashMap::new(); // Store line name for the train
+
+    for sched in &all_schedules {
+        let key = (sched.train_no.clone(), sched.week_tag.clone(), sched.in_out_tag.clone());
+        unique_trains.insert(key.clone());
+        train_line_map.insert(key, sched.line_name.clone());
+    }
+
+    println!("Identified {} unique trains. Fetching full details...", unique_trains.len());
+
+    let fetched_details = stream::iter(unique_trains.into_iter())
+        .map(|key| {
+            let client = client.clone();
+            async move {
+                let details = fetch_train_details(&client, &key).await;
+                (key, details)
+            }
+        })
+        .buffer_unordered(50) // Concurrency
+        .collect::<Vec<_>>()
+        .await;
+
+    // Build Station Name -> UID lookup
+    let mut name_to_uid: HashMap<String, String> = HashMap::new();
+    for s in &stations {
+        // Raw name: "서울(1)"
+        name_to_uid.insert(s.name.clone(), s.uid.clone());
+        // Stripped: "서울"
+        let stripped = s.name.split('(').next().unwrap().trim().to_string();
+        name_to_uid.insert(stripped.clone(), s.uid.clone());
+        name_to_uid.insert(format!("{}역", stripped), s.uid.clone());
+    }
     
     // 4. GTFS Generation (Basic)
     println!("Generating GTFS files...");
@@ -435,8 +545,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut sorted_routes: Vec<&Route> = routes.values().collect();
     sorted_routes.sort_by_key(|r| &r.id);
 
+    let rail_route_ids: HashSet<&str> = ["1-GA", "1-GA-1", "A", "B", "G", "K", "KK", "S", "SH"].iter().cloned().collect();
+    let tram_route_ids: HashSet<&str> = ["E"].iter().cloned().collect();
+
     for route in sorted_routes {
-        wtr.write_record(&[&route.id, &route.short_name, &route.long_name, "1", &route.color, "FFFFFF"])?;
+        let route_type = if rail_route_ids.contains(route.id.as_str()) { "2" } else if tram_route_ids.contains(route.id.as_str()) { "0" } else { "1" };
+        wtr.write_record(&[&route.id, &route.short_name, &route.long_name, route_type, &route.color, "FFFFFF"])?;
     }
     wtr.flush()?;
     
@@ -448,97 +562,149 @@ async fn main() -> Result<(), Box<dyn Error>> {
     wtr.write_record(&["S3", "0", "0", "0", "0", "0", "0", "1", "20250101", "20281231"])?;
     wtr.flush()?;
     
-    // stop_times.txt and trips.txt
-    let mut trip_map: HashMap<(String, String), Vec<&TrainSchedule>> = HashMap::new();
-    for sched in &all_schedules {
-        let key = (sched.train_no.clone(), sched.week_tag.clone());
-        trip_map.entry(key).or_insert(Vec::new()).push(sched);
-    }
-    
+    // trips.txt & stop_times.txt
     let mut wtr_trips = csv::Writer::from_path("gtfs_output/trips.txt")?;
     wtr_trips.write_record(&["route_id", "service_id", "trip_id", "trip_short_name", "direction_id"])?;
     
     let mut wtr_st = csv::Writer::from_path("gtfs_output/stop_times.txt")?;
     wtr_st.write_record(&["trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence"])?;
-    
-    for ((train_no, week_tag), events) in trip_map {
-        let mut events_with_time: Vec<(&TrainSchedule, u32)> = events.into_iter().map(|s| {
-            let parts: Vec<&str> = s.arrival_time.split(':').collect();
-            let h: u32 = parts[0].parse().unwrap_or(0);
-            let m: u32 = parts[1].parse().unwrap_or(0);
-            (s, h * 60 + m)
-        }).collect();
 
-        // Check for midnight crossing
-        let min_time = events_with_time.iter().map(|(_, t)| *t).min().unwrap_or(0);
-        let max_time = events_with_time.iter().map(|(_, t)| *t).max().unwrap_or(0);
-        
-        // If the spread is > 12 hours (720 mins), assume midnight crossing
-        if max_time > min_time + 720 {
-            for (_, t) in events_with_time.iter_mut() {
-                if *t < 240 { // If time is before 04:00
-                    *t += 1440;
+    let mut trip_counter = 0;
+    
+    for (key, details_opt) in fetched_details {
+        if let Some(stops) = details_opt {
+            let (train_no, week_tag, direction_id) = key;
+             // Determine route from cached map
+             let s_line = train_line_map.get(&(train_no.clone(), week_tag.clone(), direction_id.clone()))
+                .cloned()
+                .unwrap_or_else(|| "Unknown".to_string());
+
+             // Normalize s_line
+            let s_line_clean = if s_line.starts_with('0') && s_line.ends_with("호선") {
+                let trimmed = s_line.trim_start_matches('0');
+                if route_name_map.contains_key(trimmed) {
+                    trimmed.to_string()
+                } else {
+                     s_line.clone()
+                }
+            } else {
+                match s_line.as_str() {
+                    "김포도시철도" => "김포골드라인".to_string(),
+                    _ => s_line.clone(),
+                }
+            };
+
+            let s_line_no_seon = s_line_clean.trim_end_matches("선");
+
+            let route_id = if routes.contains_key(&s_line) {
+                s_line.clone()
+            } else if let Some(rid) = route_name_map.get(&s_line) {
+                rid.clone()
+            } else if let Some(rid) = route_name_map.get(&s_line_clean) {
+                rid.clone()
+            } else if let Some(rid) = route_name_map.get(s_line_no_seon) {
+                rid.clone()
+            } else {
+                 // println!("Warning: Could not link scraped line '{}'", s_line);
+                 s_line.clone() 
+            };
+
+            let service_id = format!("S{}", week_tag);
+            let trip_id = format!("T_{}_{}", service_id, train_no);
+            // direction_id from station scrape might be "1" or "2", user provided "1" in example. 
+            // GTFS uses 0 and 1. The input `inOutTag` is 1 or 2 (Inner/Outer or Up/Down).
+            // Let's map 1->0, 2->1 for now, or just use it as is if it fits constraints (0 or 1).
+            // Actually parameter is "inOutTag".
+            let gtfs_direction_id = if direction_id == "1" { "0" } else { "1" };
+
+            wtr_trips.write_record(&[&route_id, &service_id, &trip_id, &train_no, gtfs_direction_id])?;
+
+            // Process stops to handle times and stop_ids
+            // Parse times to minutes for midnight logic
+            let mut stops_with_time = Vec::new();
+            for stop in stops {
+                // Try to find stop_id
+                let stop_id = if let Some(uid) = name_to_uid.get(&stop.station_name) {
+                    uid.clone()
+                } else {
+                    // println!("Warning: Station name '{}' not found in station list.", stop.station_name);
+                    continue; 
+                };
+
+                // Time parsing
+                // If arrival is None, use departure. If departure is None, use arrival.
+                let arr_s = stop.arrival_time.as_ref().or(stop.departure_time.as_ref());
+                let dep_s = stop.departure_time.as_ref().or(stop.arrival_time.as_ref());
+
+                if let (Some(arr), Some(dep)) = (arr_s, dep_s) {
+                     fn parse_min(t: &str) -> u32 {
+                         let parts: Vec<&str> = t.split(':').collect();
+                         if parts.len() >= 2 {
+                             let h: u32 = parts[0].parse().unwrap_or(0);
+                             let m: u32 = parts[1].parse().unwrap_or(0);
+                             h * 60 + m
+                         } else { 0 }
+                     }
+                     let arr_m = parse_min(arr);
+                     let dep_m = parse_min(dep);
+                     stops_with_time.push((stop_id, arr_m, dep_m));
                 }
             }
-        }
-
-        events_with_time.sort_by_key(|(_, t)| *t);
-        let s_line = &events_with_time[0].0.line_name;
-        
-        // Normalize s_line
-        let s_line_clean = if s_line.starts_with('0') && s_line.ends_with("호선") {
-            let trimmed = s_line.trim_start_matches('0');
-            if route_name_map.contains_key(trimmed) {
-                trimmed.to_string()
-            } else {
-                 s_line.clone()
-            }
-        } else {
-            match s_line.as_str() {
-                "김포도시철도" => "김포골드라인".to_string(),
-                _ => s_line.clone(),
-            }
-        };
-
-        let s_line_no_seon = s_line_clean.trim_end_matches("선");
-
-        let route_id = if routes.contains_key(s_line) {
-            s_line.clone()
-        } else if let Some(rid) = route_name_map.get(s_line) {
-            rid.clone()
-        } else if let Some(rid) = route_name_map.get(&s_line_clean) {
-            rid.clone()
-        } else if let Some(rid) = route_name_map.get(s_line_no_seon) {
-            rid.clone()
-        } else {
-             println!("Warning: Could not link scraped line '{}' (clean: '{}') to a known route from station_data.js", s_line, s_line_clean);
-             s_line.clone() 
-        };
-        
-        let service_id = format!("S{}", week_tag);
-        let trip_id = format!("T_{}_{}", service_id, train_no);
-        let direction_id = if events_with_time[0].0.in_out_tag == "1" { "0" } else { "1" };
-        
-        wtr_trips.write_record(&[route_id.as_str(), service_id.as_str(), trip_id.as_str(), train_no.as_str(), direction_id])?;
-        
-        for (i, (bev, t)) in events_with_time.iter().enumerate() {
-            let h = t / 60;
-            let m = t % 60;
-            let time_str = format!("{:02}:{:02}:00", h, m);
             
-            wtr_st.write_record(&[
-                trip_id.as_str(),
-                time_str.as_str(),
-                time_str.as_str(),
-                bev.station_uid.as_str(),
-                (i+1).to_string().as_str()
-            ])?;
+            if stops_with_time.is_empty() { continue; }
+
+            // Midnight crossing check
+            let min_t = stops_with_time.first().map(|x| x.1).unwrap_or(0);
+            let max_t = stops_with_time.last().map(|x| x.2).unwrap_or(0);
+            
+            // Heuristic: if we encounter a large drop in time, it crossed midnight.
+            // Or if overall span looks like it wrapped.
+            // A simple per-stop check: if current time < previous time, add 24h (1440m).
+            
+            let mut offset = 0;
+            let mut last_time = 0;
+            
+            for (i, (stop_id, arr_m, dep_m)) in stops_with_time.into_iter().enumerate() {
+                let mut real_arr = arr_m + offset;
+                if real_arr < last_time {
+                    offset += 1440;
+                    real_arr += 1440;
+                }
+                
+                let mut real_dep = dep_m + offset;
+                if real_dep < real_arr {
+                    // This case handles if departure wraps immediately (rare but possible across 00:00:00?)
+                    // Or if input data has dep < arr (invalid).
+                    // Actually, if dep < arr, it probably crossed midnight *during* the stop?
+                    // But our offset logic usually handles "current vs previous stop".
+                    // If dep < arr matches local, it means it wrapped.
+                    // Let's assume monotonic within stop.
+                    if dep_m < arr_m {
+                         real_dep += 1440; // This should be covered by offset if arr didn't trigger
+                    }
+                }
+                
+                last_time = real_dep;
+
+                let fmt_time = |m: u32| {
+                    format!("{:02}:{:02}:00", m/60, m%60)
+                };
+
+                wtr_st.write_record(&[
+                    &trip_id,
+                    &fmt_time(real_arr),
+                    &fmt_time(real_dep),
+                    &stop_id,
+                    &(i+1).to_string()
+                ])?;
+            }
+            trip_counter += 1;
         }
     }
     
     wtr_trips.flush()?;
     wtr_st.flush()?;
     
-    println!("Done!");
+    println!("Done! Generated trips for {} trains.", trip_counter);
     Ok(())
 }
