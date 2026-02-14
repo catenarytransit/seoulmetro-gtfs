@@ -279,7 +279,7 @@ struct DetailedStop {
     departure_time: Option<String>,
 }
 
-async fn fetch_train_details(client: &reqwest::Client, key: &TrainKey) -> Option<Vec<DetailedStop>> {
+async fn fetch_train_details(client: &reqwest::Client, key: &TrainKey, line: &str, station_uid: &str) -> Option<Vec<DetailedStop>> {
     let (train_no, week_tag, in_out_tag) = key;
     let url = "http://www.seoulmetro.co.kr/kr/getTrainInfo.do";
     
@@ -287,10 +287,18 @@ async fn fetch_train_details(client: &reqwest::Client, key: &TrainKey) -> Option
         ("trainNo", train_no.as_str()),
         ("weekTag", week_tag.as_str()),
         ("inOutTag", in_out_tag.as_str()),
+        ("line", line),
+        ("stationId", station_uid),
     ];
-    println!("Fetching train details for {} {} {}...", train_no, week_tag, in_out_tag);
+    // println!("Fetching train details for {} {} {} (Line: {}, Stn: {})...", train_no, week_tag, in_out_tag, line, station_uid);
 
-    let resp = client.post(url)
+    // Retry logic
+    let timeouts = [20, 40, 60, 100]; // Increasing timeouts
+    let mut html_text = String::new();
+    let mut success = false;
+
+    // 1. Try with shared client first
+    match client.post(url)
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0")
         .header("Referer", "http://www.seoulmetro.co.kr/kr/cyberStation.do?menuIdx=538")
         .header("Origin", "http://www.seoulmetro.co.kr")
@@ -298,17 +306,72 @@ async fn fetch_train_details(client: &reqwest::Client, key: &TrainKey) -> Option
         .form(&params)
         .send()
         .await
-        .ok()?;
+    {
+        Ok(resp) => {
+             if resp.status().is_success() {
+                 match resp.text().await {
+                     Ok(text) => {
+                         html_text = text;
+                         success = true;
+                     },
+                     Err(e) => eprintln!("Failed to read body for train {} (default client): {}", train_no, e),
+                 }
+             } else {
+                 eprintln!("Failed to fetch train {} (default client): Status {}", train_no, resp.status());
+             }
+        },
+        Err(e) => eprintln!("Failed to fetch train {} (default client): {}", train_no, e),
+    }
 
-    if !resp.status().is_success() {
+    // 2. Retry loop if failed
+    if !success {
+        for &t in &timeouts {
+            eprintln!("Retrying train {} with {}s timeout...", train_no, t);
+            let new_client = match reqwest::Client::builder()
+                .timeout(Duration::from_secs(t))
+                .build() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Failed to build client for retry: {}", e);
+                        continue;
+                    }
+                };
+
+            match new_client.post(url)
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0")
+                .header("Referer", "http://www.seoulmetro.co.kr/kr/cyberStation.do?menuIdx=538")
+                .header("Origin", "http://www.seoulmetro.co.kr")
+                .header("X-Requested-With", "XMLHttpRequest")
+                .form(&params)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    if resp.status().is_success() {
+                        match resp.text().await {
+                            Ok(text) => {
+                                html_text = text;
+                                success = true;
+                                println!("Successfully fetched train {} with {}s timeout.", train_no, t);
+                                break;
+                            },
+                            Err(e) => eprintln!("Failed to read body for train {} ({}s timeout): {}", train_no, t, e),
+                        }
+                    } else {
+                         eprintln!("Failed to fetch train {} ({}s timeout): Status {}", train_no, t, resp.status());
+                    }
+                },
+                Err(e) => eprintln!("Failed to fetch train {} ({}s timeout): {}", train_no, t, e),
+            }
+        }
+    }
+
+    if !success {
+        eprintln!("Error: Failed to fetch details for train {} after all retries.", train_no);
         return None;
     }
 
-    let html = resp.text().await.ok()?;
-    // if html.len() < 500 {
-    //      println!("  Short response for {}: {}", train_no, html);
-    // }
-    let document = Html::parse_document(&html);
+    let document = Html::parse_document(&html_text);
     let tr_selector = Selector::parse("table.stationInfoAllTimeTable tbody tr").unwrap();
     let td_selector = Selector::parse("td").unwrap();
 
@@ -333,6 +396,9 @@ async fn fetch_train_details(client: &reqwest::Client, key: &TrainKey) -> Option
     }
     
     if stops.is_empty() {
+        eprintln!("Warning: Parsed 0 stops for train {} (HTML len: {})", train_no, html_text.len());
+        // Optional: print a snippet of HTML if it's suspicious
+        if html_text.len() < 2000 { eprintln!("HTML Content Snippet: {}", &html_text.chars().take(500).collect::<String>()); }
         None
     } else {
         Some(stops)
@@ -377,7 +443,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut station_uids = HashSet::new();
     let mut routes = HashMap::new(); 
     let mut route_name_map = HashMap::new(); 
-
     let mut range_cache: HashMap<String, (f64, f64)> = HashMap::new(); 
 
     for (line_key, line_val) in lines_data {
@@ -458,7 +523,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                  });
 
 
-
             }
         }
     }
@@ -467,8 +531,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // 3. Scrape Timetables
     println!("Starting concurrent scraping for {} stations...", stations.len());
 
-
-    
     // We clone the client for each task (it's cheap, Arc internally)
     // We move the station into the async block
     let fetches = stream::iter(stations.iter().cloned().enumerate())
@@ -486,22 +548,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("Scraping completed. Found total {} station-schedules.", all_schedules.len());
     
     // 3.5 Collect unique trains and fetch full details
-    let mut unique_trains: HashSet<TrainKey> = HashSet::new();
+    // Map key -> (line_name, station_uid)
+    let mut unique_trains_map: HashMap<TrainKey, (String, String)> = HashMap::new(); 
     let mut train_line_map: HashMap<TrainKey, String> = HashMap::new(); // Store line name for the train
 
     for sched in &all_schedules {
         let key = (sched.train_no.clone(), sched.week_tag.clone(), sched.in_out_tag.clone());
-        unique_trains.insert(key.clone());
+        // We only need one instance. We prefer if we can match the station UID from schedule?
+        // modifying unique_trains to be a HashMap.
+        unique_trains_map.entry(key.clone()).or_insert((sched.line_name.clone(), sched.station_uid.clone()));
         train_line_map.insert(key, sched.line_name.clone());
     }
 
-    println!("Identified {} unique trains. Fetching full details...", unique_trains.len());
+    let unique_trains_list: Vec<(TrainKey, String, String)> = unique_trains_map.into_iter()
+        .map(|(key, (line, uid))| (key, line, uid))
+        .collect();
+    
+    println!("Fetch full details for {} trains...", unique_trains_list.len());
 
-    let fetched_details = stream::iter(unique_trains.into_iter())
-        .map(|key| {
+    let fetched_details = stream::iter(unique_trains_list.into_iter())
+        .map(|(key, line, uid)| {
             let client = client.clone();
             async move {
-                let details = fetch_train_details(&client, &key).await;
+                let details = fetch_train_details(&client, &key, &line, &uid).await;
                 (key, details)
             }
         })
@@ -622,7 +691,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // Process stops to handle times and stop_ids
             // Parse times to minutes for midnight logic
             let mut stops_with_time = Vec::new();
-            for stop in stops {
+            for stop in &stops {
                 // Try to find stop_id
                 let stop_id = if let Some(uid) = name_to_uid.get(&stop.station_name) {
                     uid.clone()
@@ -651,11 +720,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             
-            if stops_with_time.is_empty() { continue; }
+            if stops_with_time.is_empty() { 
+                eprintln!("Warning: No valid stop times parsed for train {}, trip_id: {}. Stops raw count: {}", train_no, trip_id, stops.len());
+                continue; 
+            }
 
             // Midnight crossing check
-            let min_t = stops_with_time.first().map(|x| x.1).unwrap_or(0);
-            let max_t = stops_with_time.last().map(|x| x.2).unwrap_or(0);
+            // let _min_t = stops_with_time.first().map(|x| x.1).unwrap_or(0);
+            // let _max_t = stops_with_time.last().map(|x| x.2).unwrap_or(0);
+
             
             // Heuristic: if we encounter a large drop in time, it crossed midnight.
             // Or if overall span looks like it wrapped.
@@ -699,6 +772,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 ])?;
             }
             trip_counter += 1;
+        } else {
+            eprintln!("Error: Failed to fetch details for train {} (None returned), skipping.", key.0);
         }
     }
     
