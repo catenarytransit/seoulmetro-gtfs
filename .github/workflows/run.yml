@@ -1,4 +1,4 @@
-name: Filter European files
+name: Run Seoul Metro GTFS
 
 on:
   workflow_call:
