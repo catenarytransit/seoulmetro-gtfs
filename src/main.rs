@@ -121,7 +121,7 @@ fn load_osm_stations(path: &str) -> Result<HashMap<String, (f64, f64)>, Box<dyn 
     Ok(station_map)
 }
 
-async fn scrape_station(client: &reqwest::Client, station: Station, index: usize) -> Vec<TrainSchedule> {
+async fn scrape_station(client: &reqwest::Client, station: Station, _index: usize) -> Vec<TrainSchedule> {
     // println!("Scraping #{} - {} (UID: {})", index, station.name, station.uid); // Optional logging, might require sync printing or too verbose
     // Add delay to be more patient and prevent timeouts (per-task delay)
     // Note: If using async context, use tokio::time::sleep instead of std::thread::sleep to avoid blocking the runtime thread
@@ -155,7 +155,7 @@ async fn scrape_station(client: &reqwest::Client, station: Station, index: usize
 
     // 2. Retry with increasing timeouts if failed
     if !success {
-        let timeouts = [60, 120, 240, 480]; 
+        let timeouts = [580, 1000]; 
         for &t in &timeouts {
              eprintln!("Retrying {} with {}s timeout...", station.name, t);
              let new_client = match reqwest::Client::builder()
@@ -258,7 +258,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("Fetching station_data.js from server...");
     let station_data_url = "http://www.seoulmetro.co.kr/kr/getLineData.do";
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(120))
         .user_agent("Mozilla/5.0")
         .build()?;
     let resp = client.get(station_data_url)
@@ -314,59 +314,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     continue;
                 }
 
-                // Only take the first and last station
-                let stations_to_scrape = if valid_stations.len() > 1 {
-                    vec![valid_stations[0], valid_stations[valid_stations.len() - 1]]
-                } else {
-                    vec![valid_stations[0]]
-                };
-
-                for s in stations_to_scrape {
+                for s in valid_stations {
                      let uid = s["data-uid"].as_str().unwrap().to_string();
                      let raw_name = s["station-nm"].as_str().unwrap().to_string().replace("\r", "").replace("\n", " ");
                      
                      if station_uids.contains(&uid) {
                          continue;
                      }
-                     station_uids.insert(uid.clone());
-
-                    let name_stripped = raw_name.split('(').next().unwrap().trim().to_string();
-
-                 // Filter for termini based on line label
-                 let is_terminus = match label.as_str() {
-                     "1호선" => ["회기", "연천", "서울", "두정", "구로", "인천", "금천구청", "광명", "병점", "서동탄", "천안", "신창", "청량리"].contains(&name_stripped.as_str()),
-                     "2호선" => ["시청", "성수", "신설동", "신도림", "까치산"].contains(&name_stripped.as_str()),
-                     "3호선" => ["지축", "오금", "대화"].contains(&name_stripped.as_str()),
-                     "4호선" => ["남태령", "금정", "오이도", "불암산", "진접"].contains(&name_stripped.as_str()),
-                     "5호선" => ["방화", "상일동", "강동", "마천", "하남검단산"].contains(&name_stripped.as_str()),
-                     "6호선" => ["응암", "신내"].contains(&name_stripped.as_str()),
-                     "7호선" => ["장암", "석남"].contains(&name_stripped.as_str()),
-                     "8호선" => ["암사", "모란", "별내", "암사역사공원", "장자호수공원", "동구릉", "다산"].contains(&name_stripped.as_str()),
-                     "9호선" => ["개화", "중앙보훈병원"].contains(&name_stripped.as_str()),
-                     "우이신설경전철" => ["북한산우이", "신설동"].contains(&name_stripped.as_str()),
-                     "신림선" => ["샛강", "관악산"].contains(&name_stripped.as_str()),
-                     "공항철도" => ["서울", "인천공항2터미널"].contains(&name_stripped.as_str()),
-                     "경의중앙선" => ["서울", "문산", "임진강", "용산", "가좌", "회기", "청량리", "용문", "지평"].contains(&name_stripped.as_str()),
-                     "경춘선" => ["청량리", "상봉", "망우", "광운대", "춘천"].contains(&name_stripped.as_str()),
-                     "경강선" => ["판교", "여주"].contains(&name_stripped.as_str()),
-                     "수인분당선" => ["청량리", "왕십리", "수원", "인천"].contains(&name_stripped.as_str()),
-                     "신분당선" => ["신사", "광교"].contains(&name_stripped.as_str()),
-                     "서해선" => ["일산", "원시"].contains(&name_stripped.as_str()),
-                     "인천1호선" => ["검단호수공원", "송도달빛축제공원"].contains(&name_stripped.as_str()),
-                     "인천2호선" => ["검단오류", "운연"].contains(&name_stripped.as_str()),
-                     "자기부상철도" => ["인천공항1터미널", "용유"].contains(&name_stripped.as_str()), 
-                     "의정부경전철" => ["발곡", "차량기지 임시승강장", "탑석"].contains(&name_stripped.as_str()),
-                     "용인에버라인" => ["기흥", "전대·에버랜드"].contains(&name_stripped.as_str()),
-                     "김포골드라인" => ["양촌", "김포공항"].contains(&name_stripped.as_str()),
-                     "GTX-A" => ["수서", "동탄", "운정중앙", "서울"].contains(&name_stripped.as_str()),
-                     _ => false,
-                 };
-
-                 if !is_terminus {
-                     continue;
-                 }
                  
-                 station_uids.insert(uid.clone());
+                     station_uids.insert(uid.clone());
+                     let name_stripped = raw_name.split('(').next().unwrap().trim().to_string();
 
                  let name_with_suffix = format!("{}역", name_stripped);
                  let name_no_space = name_stripped.replace(" ", "");
@@ -461,9 +418,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // calendar.txt
     let mut wtr = csv::Writer::from_path("gtfs_output/calendar.txt")?;
     wtr.write_record(&["service_id", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "start_date", "end_date"])?;
-    wtr.write_record(&["S1", "1", "1", "1", "1", "1", "0", "0", "20240101", "20251231"])?;
-    wtr.write_record(&["S2", "0", "0", "0", "0", "0", "1", "0", "20240101", "20251231"])?;
-    wtr.write_record(&["S3", "0", "0", "0", "0", "0", "0", "1", "20240101", "20251231"])?;
+    wtr.write_record(&["S1", "1", "1", "1", "1", "1", "0", "0", "20250101", "20281231"])?;
+    wtr.write_record(&["S2", "0", "0", "0", "0", "0", "1", "0", "20250101", "20281231"])?;
+    wtr.write_record(&["S3", "0", "0", "0", "0", "0", "0", "1", "20250101", "20281231"])?;
     wtr.flush()?;
     
     // stop_times.txt and trips.txt
@@ -480,10 +437,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
     wtr_st.write_record(&["trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence"])?;
     
     for ((train_no, week_tag), events) in trip_map {
-        let mut events = events.clone();
-        events.sort_by(|a, b| a.arrival_time.cmp(&b.arrival_time));
+        let mut events_with_time: Vec<(&TrainSchedule, u32)> = events.into_iter().map(|s| {
+            let parts: Vec<&str> = s.arrival_time.split(':').collect();
+            let h: u32 = parts[0].parse().unwrap_or(0);
+            let m: u32 = parts[1].parse().unwrap_or(0);
+            (s, h * 60 + m)
+        }).collect();
+
+        // Check for midnight crossing
+        let min_time = events_with_time.iter().map(|(_, t)| *t).min().unwrap_or(0);
+        let max_time = events_with_time.iter().map(|(_, t)| *t).max().unwrap_or(0);
         
-        let s_line = &events[0].line_name;
+        // If the spread is > 12 hours (720 mins), assume midnight crossing
+        if max_time > min_time + 720 {
+            for (_, t) in events_with_time.iter_mut() {
+                if *t < 240 { // If time is before 04:00
+                    *t += 1440;
+                }
+            }
+        }
+
+        events_with_time.sort_by_key(|(_, t)| *t);
+        let s_line = &events_with_time[0].0.line_name;
         
         // Normalize s_line
         let s_line_clean = if s_line.starts_with('0') && s_line.ends_with("호선") {
@@ -513,15 +488,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         
         let service_id = format!("S{}", week_tag);
         let trip_id = format!("T_{}_{}", service_id, train_no);
-        let direction_id = if events[0].in_out_tag == "1" { "0" } else { "1" };
+        let direction_id = if events_with_time[0].0.in_out_tag == "1" { "0" } else { "1" };
         
         wtr_trips.write_record(&[route_id.as_str(), service_id.as_str(), trip_id.as_str(), train_no.as_str(), direction_id])?;
         
-        for (i, bev) in events.iter().enumerate() {
+        for (i, (bev, t)) in events_with_time.iter().enumerate() {
+            let h = t / 60;
+            let m = t % 60;
+            let time_str = format!("{:02}:{:02}:00", h, m);
+            
             wtr_st.write_record(&[
                 trip_id.as_str(),
-                bev.arrival_time.as_str(),
-                bev.departure_time.as_str(),
+                time_str.as_str(),
+                time_str.as_str(),
                 bev.station_uid.as_str(),
                 (i+1).to_string().as_str()
             ])?;
