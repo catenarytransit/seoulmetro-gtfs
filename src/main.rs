@@ -132,36 +132,67 @@ async fn scrape_station(client: &reqwest::Client, station: Station, index: usize
 
     // Fetch
     let url = format!("http://www.seoulmetro.co.kr/kr/getStationInfo.do?action=info&stationId={}", station.uid);
-    let mut resp = None;
-    for attempt in 0..16 {
-        match client.get(&url)
-            .header("Referer", "http://www.seoulmetro.co.kr/kr/cyberStation.do")
-            .send()
-            .await {
-            Ok(r) => {
-                resp = Some(r);
-                break;
-            },
-            Err(e) => {
-                if attempt < 8 {
-                    // Backoff
-                    tokio::time::sleep(Duration::from_millis(100 * (attempt + 1) as u64)).await;
-                } else {
-                    eprintln!("Failed to fetch {} after returns: {}", station.name, e);
-                    return Vec::new();
-                }
+    let mut html_text = String::new();
+    let mut success = false;
+
+    // 1. Try with shared client (default timeout ~20s)
+    match client.get(&url)
+        .header("Referer", "http://www.seoulmetro.co.kr/kr/cyberStation.do")
+        .send()
+        .await 
+    {
+        Ok(resp) => {
+            match resp.text().await {
+                Ok(text) => {
+                    html_text = text;
+                    success = true;
+                },
+                Err(e) => eprintln!("Failed to read body for {} (default client): {}", station.name, e),
             }
+        },
+        Err(e) => eprintln!("Failed to fetch {} (default client): {}", station.name, e),
+    }
+
+    // 2. Retry with increasing timeouts if failed
+    if !success {
+        let timeouts = [60, 120, 240, 480]; 
+        for &t in &timeouts {
+             eprintln!("Retrying {} with {}s timeout...", station.name, t);
+             let new_client = match reqwest::Client::builder()
+                 .timeout(Duration::from_secs(t))
+                 .build() {
+                     Ok(c) => c,
+                     Err(e) => {
+                         eprintln!("Failed to build client: {}", e);
+                         continue;
+                     }
+                 };
+                 
+             match new_client.get(&url)
+                .header("Referer", "http://www.seoulmetro.co.kr/kr/cyberStation.do")
+                .send()
+                .await 
+             {
+                 Ok(resp) => {
+                     match resp.text().await {
+                         Ok(text) => {
+                             html_text = text;
+                             success = true;
+                             println!("Successfully fetched {} with {}s timeout.", station.name, t);
+                             break;
+                         },
+                         Err(e) => eprintln!("Failed to read body for {} ({}s timeout): {}", station.name, t, e),
+                     }
+                 },
+                 Err(e) => eprintln!("Failed to fetch {} ({}s timeout): {}", station.name, t, e),
+             }
         }
     }
-    let resp = resp.unwrap();
-    
-    let html_text = match resp.text().await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Failed to read body {}: {}", station.name, e);
-            return Vec::new();
-        }
-    };
+
+    if !success {
+        eprintln!("Failed to fetch/read {} after all retries.", station.name);
+        return Vec::new();
+    }
 
     // Parse
     let fragment = Html::parse_document(&html_text);
