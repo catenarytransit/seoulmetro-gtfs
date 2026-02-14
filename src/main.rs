@@ -463,7 +463,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                  s_line.clone()
             }
         } else {
-            s_line.clone()
+            match s_line.as_str() {
+                "김포도시철도" => "김포골드라인".to_string(),
+                _ => s_line.clone(),
+            }
         };
 
         let route_id = if routes.contains_key(s_line) {
