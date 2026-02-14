@@ -1,0 +1,43 @@
+name: Filter European files
+
+on:
+  workflow_call:
+
+jobs:
+  upload-release-asset:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install rust
+        run: rustup toolchain install stable
+
+      - name: compile
+        run: cargo build --release
+
+      - name: run
+        run: cargo run --release
+
+      - name: Zip gtfs_output to gtfs.zip
+        run: |
+          cd gtfs_output
+          zip -r ../gtfs.zip .
+          cd ..
+
+      - name: Upload results
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITUHB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          ASSET_PATH: gtfs.zip
+          ASSET_NAME: gtfs.zip
+          RELEASE_TAG: latest
+        run: |
+          echo "Uploading asset: $ASSET_PATH as $ASSET_NAME to release latest"
+          gh release upload latest "$ASSET_PATH" --clobber
+        shell: bash
+        if: env.ASSET_PATH != '' && env.ASSET_NAME != ''

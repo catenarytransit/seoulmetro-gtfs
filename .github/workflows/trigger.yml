@@ -1,0 +1,9 @@
+name: Manual Trigger
+
+on:
+  workflow_dispatch:
+
+jobs:
+  trigger:
+    uses: ./.github/workflows/run.yml
+    secrets: inherit
