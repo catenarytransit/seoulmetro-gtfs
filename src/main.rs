@@ -84,11 +84,32 @@ async fn download_pbf_if_needed() -> Result<String, Box<dyn Error>> {
     Ok(path.to_string())
 }
 
-fn load_osm_stations(path: &str) -> Result<HashMap<String, (f64, f64)>, Box<dyn Error + Send + Sync>> {
+fn dist_sq(p1: (f64, f64), p2: (f64, f64)) -> f64 {
+    let dx = p1.0 - p2.0;
+    let dy = p1.1 - p2.1;
+    dx * dx + dy * dy
+}
+
+fn get_best_candidate(candidates: &[(f64, f64)]) -> (f64, f64) {
+    let seoul_center = (37.5665, 126.9780);
+    let mut best_cand = candidates[0];
+    let mut min_dist = dist_sq(best_cand, seoul_center);
+
+    for &cand in &candidates[1..] {
+        let d = dist_sq(cand, seoul_center);
+        if d < min_dist {
+            min_dist = d;
+            best_cand = cand;
+        }
+    }
+    best_cand
+}
+
+fn load_osm_stations(path: &str) -> Result<HashMap<String, Vec<(f64, f64)>>, Box<dyn Error + Send + Sync>> {
     println!("Reading OSM PBF data from {}...", path);
     let file = fs::File::open(path)?;
     let mut pbf = OsmPbfReader::new(file);
-    let mut station_map = HashMap::new();
+    let mut station_map: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
     
     // We strictly only look for nodes for now to get coordinates easily.
     // If we need ways/relations, we need a way to calc centroid.
@@ -103,21 +124,22 @@ fn load_osm_stations(path: &str) -> Result<HashMap<String, (f64, f64)>, Box<dyn 
                 // Insert by all possible names
                 let lat = node.lat();
                 let lon = node.lon();
+                let coords = (lat, lon);
                 
                 if let Some(name) = node.tags.get("name") {
-                    station_map.insert(name.to_string(), (lat, lon));
+                    station_map.entry(name.to_string()).or_default().push(coords);
                 }
                 if let Some(name_ko) = node.tags.get("name:ko") {
-                    station_map.insert(name_ko.to_string(), (lat, lon));
+                    station_map.entry(name_ko.to_string()).or_default().push(coords);
                 }
                 if let Some(name_en) = node.tags.get("name:en") {
-                    station_map.insert(name_en.to_string(), (lat, lon));
+                    station_map.entry(name_en.to_string()).or_default().push(coords);
                 }
             }
         }
     }
     
-    println!("Loaded {} locations from OSM PBF.", station_map.len());
+    println!("Loaded {} name entries from OSM PBF.", station_map.len());
     Ok(station_map)
 }
 
@@ -330,16 +352,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                  let name_no_space_suffix = format!("{}역", name_no_space);
                  
                  // Lookup priority: 
-                 let (lat, lon) = if let Some(&coords) = osm_stations.get(&raw_name) {
-                     coords
-                 } else if let Some(&coords) = osm_stations.get(&name_stripped) {
-                     coords
-                 } else if let Some(&coords) = osm_stations.get(&name_with_suffix) {
-                     coords
-                 } else if let Some(&coords) = osm_stations.get(&name_no_space) {
-                     coords
-                 } else if let Some(&coords) = osm_stations.get(&name_no_space_suffix) {
-                     coords
+                 let (lat, lon) = if let Some(coords) = osm_stations.get(&raw_name) {
+                     get_best_candidate(coords)
+                 } else if let Some(coords) = osm_stations.get(&name_stripped) {
+                     get_best_candidate(coords)
+                 } else if let Some(coords) = osm_stations.get(&name_with_suffix) {
+                     get_best_candidate(coords)
+                 } else if let Some(coords) = osm_stations.get(&name_no_space) {
+                     get_best_candidate(coords)
+                 } else if let Some(coords) = osm_stations.get(&name_no_space_suffix) {
+                     get_best_candidate(coords)
                  } else if let Some(&coords) = range_cache.get(&raw_name) {
                      coords
                  } else {
@@ -355,12 +377,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                  
                  stations.push(Station {
                      uid,
-                     name: raw_name,
+                     name: raw_name.clone(),
                      lat,
                      lon,
                      line_name: line_key.clone(),
                      line_id: line_key.clone(),
                  });
+
+
+
             }
         }
     }
@@ -475,11 +500,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         };
 
+        let s_line_no_seon = s_line_clean.trim_end_matches("선");
+
         let route_id = if routes.contains_key(s_line) {
             s_line.clone()
         } else if let Some(rid) = route_name_map.get(s_line) {
             rid.clone()
         } else if let Some(rid) = route_name_map.get(&s_line_clean) {
+            rid.clone()
+        } else if let Some(rid) = route_name_map.get(s_line_no_seon) {
             rid.clone()
         } else {
              println!("Warning: Could not link scraped line '{}' (clean: '{}') to a known route from station_data.js", s_line, s_line_clean);
