@@ -1,0 +1,10 @@
+name: Seoul Metro GTFS Scheduler
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  trigger:
+    uses: ./.github/workflows/run.yml
+    secrets: inherit
