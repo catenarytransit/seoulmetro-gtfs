@@ -466,7 +466,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     
     // 3. Scrape Timetables
     println!("Starting concurrent scraping for {} stations...", stations.len());
-    stations.truncate(1); // TEMPORARY: Truncate for fast verification
+
 
     
     // We clone the client for each task (it's cheap, Arc internally)
