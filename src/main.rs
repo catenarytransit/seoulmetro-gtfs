@@ -227,7 +227,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("Fetching station_data.js from server...");
     let station_data_url = "http://www.seoulmetro.co.kr/kr/getLineData.do";
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
         .user_agent("Mozilla/5.0")
         .build()?;
     let resp = client.get(station_data_url)
