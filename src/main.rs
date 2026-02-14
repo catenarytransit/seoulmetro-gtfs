@@ -288,7 +288,7 @@ async fn fetch_train_details(client: &reqwest::Client, key: &TrainKey) -> Option
         ("weekTag", week_tag.as_str()),
         ("inOutTag", in_out_tag.as_str()),
     ];
-    // println!("Fetching train details for {} {} {}...", train_no, week_tag, in_out_tag);
+    println!("Fetching train details for {} {} {}...", train_no, week_tag, in_out_tag);
 
     let resp = client.post(url)
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0")
