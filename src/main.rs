@@ -478,7 +478,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 scrape_station(&client, station, i).await
             }
         })
-        .buffer_unordered(4); // Concurrency limit
+        .buffer_unordered(16); // Concurrency limit
 
     let all_schedules_nested: Vec<Vec<TrainSchedule>> = fetches.collect().await;
     let all_schedules: Vec<TrainSchedule> = all_schedules_nested.into_iter().flatten().collect();
