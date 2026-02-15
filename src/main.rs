@@ -659,6 +659,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             } else {
                 match s_line.as_str() {
                     "김포도시철도" => "김포골드라인".to_string(),
+                    "경의선" => "경의·중앙선".to_string(),
                     _ => s_line.clone(),
                 }
             };
