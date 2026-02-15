@@ -264,7 +264,7 @@ async fn scrape_station(client: &reqwest::Client, station: Station, _index: usiz
     if station_schedules.is_empty() {
         // println!("  Warning: Found 0 schedules for {}. HTML length: {}", station.name, html_text.len());
     } else {
-        println!("Fetched {} - {} schedules.", station.name, station_schedules.len());
+        // println!("Fetched {} - {} schedules.", station.name, station_schedules.len());
     }
 
     station_schedules
@@ -309,32 +309,23 @@ async fn fetch_train_details(client: &reqwest::Client, key: &TrainKey, line: &st
     {
         Ok(resp) => {
              if resp.status().is_success() {
-                 match resp.text().await {
-                     Ok(text) => {
-                         html_text = text;
-                         success = true;
-                     },
-                     Err(e) => eprintln!("Failed to read body for train {} (default client): {}", train_no, e),
+                 if let Ok(text) = resp.text().await {
+                     html_text = text;
+                     success = true;
                  }
-             } else {
-                 eprintln!("Failed to fetch train {} (default client): Status {}", train_no, resp.status());
              }
         },
-        Err(e) => eprintln!("Failed to fetch train {} (default client): {}", train_no, e),
+        Err(_) => {},
     }
 
     // 2. Retry loop if failed
     if !success {
         for &t in &timeouts {
-            eprintln!("Retrying train {} with {}s timeout...", train_no, t);
             let new_client = match reqwest::Client::builder()
                 .timeout(Duration::from_secs(t))
                 .build() {
                     Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("Failed to build client for retry: {}", e);
-                        continue;
-                    }
+                    Err(_) => continue,
                 };
 
             match new_client.post(url)
@@ -348,20 +339,14 @@ async fn fetch_train_details(client: &reqwest::Client, key: &TrainKey, line: &st
             {
                 Ok(resp) => {
                     if resp.status().is_success() {
-                        match resp.text().await {
-                            Ok(text) => {
-                                html_text = text;
-                                success = true;
-                                println!("Successfully fetched train {} with {}s timeout.", train_no, t);
-                                break;
-                            },
-                            Err(e) => eprintln!("Failed to read body for train {} ({}s timeout): {}", train_no, t, e),
+                        if let Ok(text) = resp.text().await {
+                            html_text = text;
+                            success = true;
+                            break;
                         }
-                    } else {
-                         eprintln!("Failed to fetch train {} ({}s timeout): Status {}", train_no, t, resp.status());
                     }
                 },
-                Err(e) => eprintln!("Failed to fetch train {} ({}s timeout): {}", train_no, t, e),
+                Err(_) => {},
             }
         }
     }
@@ -372,26 +357,30 @@ async fn fetch_train_details(client: &reqwest::Client, key: &TrainKey, line: &st
     }
 
     let document = Html::parse_document(&html_text);
-    let tr_selector = Selector::parse("table.stationInfoAllTimeTable tbody tr").unwrap();
+    let table_selector = Selector::parse("table.stationInfoAllTimeTable").unwrap();
+    let tr_selector = Selector::parse("tbody tr").unwrap();
     let td_selector = Selector::parse("td").unwrap();
 
     let mut stops = Vec::new();
 
-    for tr in document.select(&tr_selector) {
-        let tds: Vec<_> = tr.select(&td_selector).collect();
-        if tds.len() >= 3 {
-            let station_name = tds[0].text().collect::<Vec<_>>().join("").trim().to_string();
-            let arr_raw = tds[1].text().collect::<Vec<_>>().join("").trim().to_string();
-            let dep_raw = tds[2].text().collect::<Vec<_>>().join("").trim().to_string();
+    // Select the first table only
+    if let Some(table) = document.select(&table_selector).next() {
+        for tr in table.select(&tr_selector) {
+            let tds: Vec<_> = tr.select(&td_selector).collect();
+            if tds.len() >= 3 {
+                let station_name = tds[0].text().collect::<Vec<_>>().join("").trim().to_string();
+                let arr_raw = tds[1].text().collect::<Vec<_>>().join("").trim().to_string();
+                let dep_raw = tds[2].text().collect::<Vec<_>>().join("").trim().to_string();
 
-            let arrival_time = if arr_raw.is_empty() { None } else { Some(format!("{}:00", arr_raw)) };
-            let departure_time = if dep_raw.is_empty() { None } else { Some(format!("{}:00", dep_raw)) };
+                let arrival_time = if arr_raw.is_empty() { None } else { Some(format!("{}:00", arr_raw)) };
+                let departure_time = if dep_raw.is_empty() { None } else { Some(format!("{}:00", dep_raw)) };
 
-            stops.push(DetailedStop {
-                station_name,
-                arrival_time,
-                departure_time,
-            });
+                stops.push(DetailedStop {
+                    station_name,
+                    arrival_time,
+                    departure_time,
+                });
+            }
         }
     }
     
@@ -622,29 +611,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
         wtr.write_record(&[&route.id, &route.short_name, &route.long_name, route_type, &route.color, "FFFFFF"])?;
     }
     wtr.flush()?;
-    
-    // calendar.txt
-    let mut wtr = csv::Writer::from_path("gtfs_output/calendar.txt")?;
-    wtr.write_record(&["service_id", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "start_date", "end_date"])?;
-    wtr.write_record(&["S1", "1", "1", "1", "1", "1", "0", "0", "20250101", "20281231"])?;
-    wtr.write_record(&["S2", "0", "0", "0", "0", "0", "1", "0", "20250101", "20281231"])?;
-    wtr.write_record(&["S3", "0", "0", "0", "0", "0", "0", "1", "20250101", "20281231"])?;
-    wtr.flush()?;
-    
-    // trips.txt & stop_times.txt
-    let mut wtr_trips = csv::Writer::from_path("gtfs_output/trips.txt")?;
-    wtr_trips.write_record(&["route_id", "service_id", "trip_id", "trip_short_name", "direction_id"])?;
-    
-    let mut wtr_st = csv::Writer::from_path("gtfs_output/stop_times.txt")?;
-    wtr_st.write_record(&["trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence"])?;
+
+    // Data collection structs
+    // Key: (TrainNo, Direction, SignatureOfStops)
+    // Value: Set of WeekTags (e.g., {"1", "2"})
+    type TripSignature = Vec<(String, u32, u32)>; // (stop_id, arr_time_min, dep_time_min)
+    #[derive(Hash, PartialEq, Eq, Clone)]
+    struct TripKey {
+        train_no: String,
+        direction_id: String, // "0" or "1"
+        signature: TripSignature,
+    }
+    let mut aggregated_trips: HashMap<TripKey, HashSet<String>> = HashMap::new();
+    let mut trip_route_map: HashMap<TripKey, String> = HashMap::new();
 
     let mut trip_counter = 0;
     
     for (key, details_opt) in fetched_details {
         if let Some(stops) = details_opt {
-            let (train_no, week_tag, direction_id) = key;
+            let (train_no, week_tag, direction_id_raw) = key;
              // Determine route from cached map
-             let s_line = train_line_map.get(&(train_no.clone(), week_tag.clone(), direction_id.clone()))
+             let s_line = train_line_map.get(&(train_no.clone(), week_tag.clone(), direction_id_raw.clone()))
                 .cloned()
                 .unwrap_or_else(|| "Unknown".to_string());
 
@@ -675,34 +662,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
             } else if let Some(rid) = route_name_map.get(s_line_no_seon) {
                 rid.clone()
             } else {
-                 // println!("Warning: Could not link scraped line '{}'", s_line);
                  s_line.clone() 
             };
 
-            let service_id = format!("S{}", week_tag);
-            let trip_id = format!("T_{}_{}", service_id, train_no);
-            // direction_id from station scrape might be "1" or "2", user provided "1" in example. 
-            // GTFS uses 0 and 1. The input `inOutTag` is 1 or 2 (Inner/Outer or Up/Down).
-            // Let's map 1->0, 2->1 for now, or just use it as is if it fits constraints (0 or 1).
-            // Actually parameter is "inOutTag".
-            let gtfs_direction_id = if direction_id == "1" { "0" } else { "1" };
-
-            wtr_trips.write_record(&[&route_id, &service_id, &trip_id, &train_no, gtfs_direction_id])?;
+            let gtfs_direction_id = if direction_id_raw == "1" { "0" } else { "1" };
 
             // Process stops to handle times and stop_ids
-            // Parse times to minutes for midnight logic
-            let mut stops_with_time = Vec::new();
+            let mut stops_with_time: TripSignature = Vec::new();
+            
             for stop in &stops {
-                // Try to find stop_id
                 let stop_id = if let Some(uid) = name_to_uid.get(&stop.station_name) {
                     uid.clone()
                 } else {
-                    // println!("Warning: Station name '{}' not found in station list.", stop.station_name);
                     continue; 
                 };
 
                 // Time parsing
-                // If arrival is None, use departure. If departure is None, use arrival.
                 let arr_s = stop.arrival_time.as_ref().or(stop.departure_time.as_ref());
                 let dep_s = stop.departure_time.as_ref().or(stop.arrival_time.as_ref());
 
@@ -722,23 +697,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             
             if stops_with_time.is_empty() { 
-                eprintln!("Warning: No valid stop times parsed for train {}, trip_id: {}. Stops raw count: {}", train_no, trip_id, stops.len());
                 continue; 
             }
 
-            // Midnight crossing check
-            // let _min_t = stops_with_time.first().map(|x| x.1).unwrap_or(0);
-            // let _max_t = stops_with_time.last().map(|x| x.2).unwrap_or(0);
-
-            
-            // Heuristic: if we encounter a large drop in time, it crossed midnight.
-            // Or if overall span looks like it wrapped.
-            // A simple per-stop check: if current time < previous time, add 24h (1440m).
-            
+            // Calculate offsets and real times
+            let mut processed_signature: TripSignature = Vec::new();
             let mut offset = 0;
             let mut last_time = 0;
+            let mut max_time_found = 0;
+            let mut valid_trip = true;
             
-            for (i, (stop_id, arr_m, dep_m)) in stops_with_time.into_iter().enumerate() {
+            for (stop_id, arr_m, dep_m) in stops_with_time {
                 let mut real_arr = arr_m + offset;
                 if real_arr < last_time {
                     offset += 1440;
@@ -747,40 +716,109 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 
                 let mut real_dep = dep_m + offset;
                 if real_dep < real_arr {
-                    // This case handles if departure wraps immediately (rare but possible across 00:00:00?)
-                    // Or if input data has dep < arr (invalid).
-                    // Actually, if dep < arr, it probably crossed midnight *during* the stop?
-                    // But our offset logic usually handles "current vs previous stop".
-                    // If dep < arr matches local, it means it wrapped.
-                    // Let's assume monotonic within stop.
-                    if dep_m < arr_m {
-                         real_dep += 1440; // This should be covered by offset if arr didn't trigger
-                    }
+                    real_dep += 1440;
                 }
                 
                 last_time = real_dep;
-
-                let fmt_time = |m: u32| {
-                    format!("{:02}:{:02}:00", m/60, m%60)
-                };
-
-                wtr_st.write_record(&[
-                    &trip_id,
-                    &fmt_time(real_arr),
-                    &fmt_time(real_dep),
-                    &stop_id,
-                    &(i+1).to_string()
-                ])?;
+                if real_dep > max_time_found { max_time_found = real_dep; }
+                
+                processed_signature.push((stop_id, real_arr, real_dep));
             }
-            trip_counter += 1;
-        } else {
-            eprintln!("Error: Failed to fetch details for train {} (None returned), skipping.", key.0);
+
+            // *** 28-Hour Check ***
+            if max_time_found > 28 * 60 {
+                // println!("Skipping trip {} due to excessive time: {} min ({:.1} hours)", train_no, max_time_found, max_time_found as f64 / 60.0);
+                valid_trip = false;
+            }
+
+            if valid_trip {
+                let t_key = TripKey {
+                    train_no: train_no.clone(),
+                    direction_id: gtfs_direction_id.to_string(),
+                    signature: processed_signature,
+                };
+                
+                aggregated_trips.entry(t_key.clone()).or_default().insert(week_tag);
+                trip_route_map.entry(t_key).or_insert(route_id); // keep first route found
+                trip_counter += 1;
+            }
+        }
+    }
+    
+    println!("Aggregated {} unique valid trips.", aggregated_trips.len());
+
+    // Generate Calendar and write Trips
+    // We map sets of week_tags to a ServiceID.
+    // e.g. {"1"} -> "S1", {"1", "2"} -> "S1_2".
+    
+    let mut service_id_map: HashMap<String, HashSet<String>> = HashMap::new(); // ServiceID -> Set<WeekTags>
+    
+    // Sort keys for deterministic output
+    let mut final_trips: Vec<_> = aggregated_trips.into_iter().collect();
+    final_trips.sort_by(|a, b| a.0.train_no.cmp(&b.0.train_no));
+    
+    let mut wtr_trips = csv::Writer::from_path("gtfs_output/trips.txt")?;
+    wtr_trips.write_record(&["route_id", "service_id", "trip_id", "trip_short_name", "direction_id"])?;
+    
+    let mut wtr_st = csv::Writer::from_path("gtfs_output/stop_times.txt")?;
+    wtr_st.write_record(&["trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence"])?;
+
+    for (key, week_tags) in final_trips {
+        // Create normalized service ID
+        let mut sorted_tags: Vec<_> = week_tags.iter().collect();
+        sorted_tags.sort();
+        let service_id = format!("S{}", sorted_tags.into_iter().map(|s| s.as_str()).collect::<Vec<_>>().join("_"));
+        
+        // Register service ID
+        service_id_map.entry(service_id.clone()).or_insert_with(|| week_tags.clone());
+
+        let trip_id = format!("T_{}_{}", service_id, key.train_no);
+        let route_id = trip_route_map.get(&key).unwrap();
+        
+        wtr_trips.write_record(&[route_id, &service_id, &trip_id, &key.train_no, &key.direction_id])?;
+
+        for (i, (stop_id, arr_m, dep_m)) in key.signature.into_iter().enumerate() {
+            let fmt_time = |m: u32| {
+                format!("{:02}:{:02}:00", m/60, m%60)
+            };
+            wtr_st.write_record(&[
+                &trip_id,
+                &fmt_time(arr_m),
+                &fmt_time(dep_m),
+                &stop_id,
+                &(i+1).to_string()
+            ])?;
         }
     }
     
     wtr_trips.flush()?;
     wtr_st.flush()?;
+
+    // Write dynamic calendar.txt
+    let mut wtr_cal = csv::Writer::from_path("gtfs_output/calendar.txt")?;
+    wtr_cal.write_record(&["service_id", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "start_date", "end_date"])?;
     
-    println!("Done! Generated trips for {} trains.", trip_counter);
+    let mut sorted_services: Vec<_> = service_id_map.keys().collect();
+    sorted_services.sort();
+    
+    for s_id in sorted_services {
+        let tags = service_id_map.get(s_id).unwrap();
+        let is_weekday = tags.contains("1");
+        let is_saturday = tags.contains("2");
+        let is_sunday = tags.contains("3");
+        
+        let mon = if is_weekday { "1" } else { "0" };
+        let tue = if is_weekday { "1" } else { "0" };
+        let wed = if is_weekday { "1" } else { "0" };
+        let thu = if is_weekday { "1" } else { "0" };
+        let fri = if is_weekday { "1" } else { "0" };
+        let sat = if is_saturday { "1" } else { "0" };
+        let sun = if is_sunday { "1" } else { "0" };
+        
+        wtr_cal.write_record(&[s_id, mon, tue, wed, thu, fri, sat, sun, "20250101", "20281231"])?;
+    }
+    wtr_cal.flush()?;
+    
+    println!("Done! Generated files.");
     Ok(())
 }
