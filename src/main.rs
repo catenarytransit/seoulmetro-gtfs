@@ -204,7 +204,7 @@ async fn scrape_station(
 
     // 2. Retry with increasing timeouts if failed
     if !success {
-        let timeouts = [580, 800, 800, 1000, 1000, 2000];
+        let timeouts = [10, 20, 20, 20, 20, 30, 30, 30, 30, 30];
         for &t in &timeouts {
             eprintln!("Retrying {} with {}s timeout...", station.name, t);
             let new_client = match reqwest::Client::builder()
@@ -662,7 +662,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 (key, details)
             }
         })
-        .buffer_unordered(128) // Concurrency
+        .buffer_unordered(64) // Concurrency
         .collect::<Vec<_>>()
         .await;
 
