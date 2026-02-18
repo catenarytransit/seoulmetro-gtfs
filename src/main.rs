@@ -324,7 +324,7 @@ async fn fetch_train_details(
     // println!("Fetching train details for {} {} {} (Line: {}, Stn: {})...", train_no, week_tag, in_out_tag, line, station_uid);
 
     // Retry logic
-    let timeouts = [20, 40, 60, 100, 500]; // Increasing timeouts
+    let timeouts = [20, 40, 40, 40, 50, 50]; // Increasing timeouts
     let mut html_text = String::new();
     let mut success = false;
 
