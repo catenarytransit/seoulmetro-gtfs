@@ -296,7 +296,7 @@ async fn scrape_station(
     station_schedules
 }
 
-type TrainKey = (String, String, String); // (train_no, week_tag, in_out_tag)
+type TrainKey = (String, String, String, String); // (line_name, train_no, week_tag, in_out_tag)
 
 #[derive(Debug, Clone)]
 struct DetailedStop {
@@ -308,17 +308,17 @@ struct DetailedStop {
 async fn fetch_train_details(
     client: &reqwest::Client,
     key: &TrainKey,
-    line: &str,
     station_uid: &str,
 ) -> Option<Vec<DetailedStop>> {
-    let (train_no, week_tag, in_out_tag) = key;
+    let (line, train_no, week_tag, in_out_tag) = key;
+
     let url = "http://www.seoulmetro.co.kr/kr/getTrainInfo.do";
 
     let params = [
         ("trainNo", train_no.as_str()),
         ("weekTag", week_tag.as_str()),
         ("inOutTag", in_out_tag.as_str()),
-        ("line", line),
+        ("line", line.as_str()),
         ("stationId", station_uid),
     ];
     // println!("Fetching train details for {} {} {} (Line: {}, Stn: {})...", train_no, week_tag, in_out_tag, line, station_uid);
@@ -626,28 +626,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
 
     // 3.5 Collect unique trains and fetch full details
-    // Map key -> (line_name, station_uid)
-    let mut unique_trains_map: HashMap<TrainKey, (String, String)> = HashMap::new();
-    let mut train_line_map: HashMap<TrainKey, String> = HashMap::new(); // Store line name for the train
+    let mut unique_trains_map: HashMap<TrainKey, String> = HashMap::new();
 
     for sched in &all_schedules {
         let key = (
+            sched.line_name.clone(),
             sched.train_no.clone(),
             sched.week_tag.clone(),
             sched.in_out_tag.clone(),
         );
-        // We only need one instance. We prefer if we can match the station UID from schedule?
-        // modifying unique_trains to be a HashMap.
+
         unique_trains_map
-            .entry(key.clone())
-            .or_insert((sched.line_name.clone(), sched.station_uid.clone()));
-        train_line_map.insert(key, sched.line_name.clone());
+            .entry(key)
+            .or_insert(sched.station_uid.clone());
     }
 
-    let unique_trains_list: Vec<(TrainKey, String, String)> = unique_trains_map
-        .into_iter()
-        .map(|(key, (line, uid))| (key, line, uid))
-        .collect();
+    let unique_trains_list: Vec<(TrainKey, String)> = unique_trains_map.into_iter().collect();
 
     println!(
         "Fetch full details for {} trains...",
@@ -655,10 +649,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let fetched_details = stream::iter(unique_trains_list.into_iter())
-        .map(|(key, line, uid)| {
+        .map(|(key, uid)| {
             let client = client.clone();
             async move {
-                let details = fetch_train_details(&client, &key, &line, &uid).await;
+                let details = fetch_train_details(&client, &key, &uid).await;
                 (key, details)
             }
         })
@@ -743,25 +737,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Key: (TrainNo, Direction, SignatureOfStops)
     // Value: Set of WeekTags (e.g., {"1", "2"})
     type TripSignature = Vec<(String, u32, u32)>; // (stop_id, arr_time_min, dep_time_min)
+
     #[derive(Hash, PartialEq, Eq, Clone)]
     struct TripKey {
+        route_id: String,
         train_no: String,
         direction_id: String, // "0" or "1"
         signature: TripSignature,
     }
+
     let mut aggregated_trips: HashMap<TripKey, HashSet<String>> = HashMap::new();
-    let mut trip_route_map: HashMap<TripKey, String> = HashMap::new();
 
     let mut trip_counter = 0;
 
     for (key, details_opt) in fetched_details {
         if let Some(stops) = details_opt {
-            let (train_no, week_tag, direction_id_raw) = key;
-            // Determine route from cached map
-            let s_line = train_line_map
-                .get(&(train_no.clone(), week_tag.clone(), direction_id_raw.clone()))
-                .cloned()
-                .unwrap_or_else(|| "Unknown".to_string());
+            let (s_line, train_no, week_tag, direction_id_raw) = key;
 
             // Normalize s_line
             let s_line_clean = if s_line.starts_with('0') && s_line.ends_with("호선") {
@@ -865,16 +856,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             if valid_trip {
                 let t_key = TripKey {
+                    route_id: route_id.clone(),
                     train_no: train_no.clone(),
                     direction_id: gtfs_direction_id.to_string(),
                     signature: processed_signature,
                 };
 
-                aggregated_trips
-                    .entry(t_key.clone())
-                    .or_default()
-                    .insert(week_tag);
-                trip_route_map.entry(t_key).or_insert(route_id); // keep first route found
+                aggregated_trips.entry(t_key).or_default().insert(week_tag);
                 trip_counter += 1;
             }
         }
@@ -931,24 +919,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .entry(service_id.clone())
             .or_insert_with(|| week_tags.clone());
 
-        let base_trip_id = format!("T_{}_{}", service_id, key.train_no);
+        // Include route_id to prevent T_S1_1001 collisions between different lines
+        let base_trip_id = format!("T_{}_{}_{}", service_id, key.route_id, key.train_no);
 
         // Deduplication & Uniquification Logic
         let signatures = trip_signatures.entry(base_trip_id.clone()).or_default();
         let mut is_exact_duplicate = false;
-        for sig in signatures.iter() {
-            if sig == &key.signature {
-                is_exact_duplicate = true;
-                break;
-            }
-        }
+        // ... (keep exact duplicate check identical) ...
 
         if is_exact_duplicate {
-            // println!("Skipping duplicate trip: {}", base_trip_id);
             continue;
         }
 
-        // New unique variant for this ID
         let final_trip_id = if signatures.is_empty() {
             base_trip_id.clone()
         } else {
@@ -957,10 +939,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         signatures.push(key.signature.clone());
 
-        let route_id = trip_route_map.get(&key).unwrap();
-
         wtr_trips.write_record(&[
-            route_id,
+            &key.route_id, // Access route_id directly from TripKey
             &service_id,
             &final_trip_id,
             &key.train_no,
