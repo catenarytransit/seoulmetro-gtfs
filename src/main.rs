@@ -608,14 +608,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         stations.len()
     );
 
-    // We clone the client for each task (it's cheap, Arc internally)
-    // We move the station into the async block
     let fetches = stream::iter(stations.iter().cloned().enumerate())
         .map(|(i, station)| {
             let client = client.clone();
             async move { scrape_station(&client, station, i).await }
         })
-        .buffer_unordered(24); // Concurrency limit
+        .buffer_unordered(32); // Concurrency limit
 
     let all_schedules_nested: Vec<Vec<TrainSchedule>> = fetches.collect().await;
     let all_schedules: Vec<TrainSchedule> = all_schedules_nested.into_iter().flatten().collect();
@@ -656,7 +654,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 (key, details)
             }
         })
-        .buffer_unordered(64) // Concurrency
+        .buffer_unordered(128)
         .collect::<Vec<_>>()
         .await;
 
